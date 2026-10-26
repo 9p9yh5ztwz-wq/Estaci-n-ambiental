@@ -1,0 +1,930 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+
+// ======================================================
+// SERVIDOR WEB
+// ======================================================
+
+WebServer servidor(80);
+
+
+// ======================================================
+// ÚLTIMOS DATOS RECIBIDOS DEL ARDUINO
+// ======================================================
+
+float temperatura = 0;
+float humedad = 0;
+float dsm = -1;
+
+int mq = 0;
+
+bool recibido = false;
+bool dhtOk = false;
+
+uint32_t ultimaTrama = 0;
+uint32_t rechazadas = 0;
+
+
+// ======================================================
+// BUFFER DE RECEPCIÓN UART
+// ======================================================
+
+char bufferRx[96];
+
+size_t usados = 0;
+
+bool descartar = false;
+
+uint32_t ultimoByte = 0;
+
+
+// ======================================================
+// PÁGINA WEB
+// ======================================================
+
+const char PAGINA[] PROGMEM = R"HTML(
+
+<!doctype html>
+
+<html lang="es">
+
+<meta charset="utf-8">
+
+<meta
+  name="viewport"
+  content="width=device-width,initial-scale=1"
+>
+
+<title>Estación ambiental</title>
+
+
+<style>
+
+body{
+  margin:0;
+  background:#f1f6ef;
+  color:#173d2b;
+  font:17px system-ui,sans-serif;
+}
+
+main{
+  max-width:950px;
+  margin:auto;
+  padding:24px;
+}
+
+header{
+  background:#123e2b;
+  color:white;
+  padding:28px;
+  border-radius:20px;
+}
+
+h1{
+  margin:0 0 10px;
+  font-size:clamp(26px,5vw,40px);
+}
+
+.grid{
+  display:grid;
+  grid-template-columns:
+    repeat(auto-fit,minmax(220px,1fr));
+  gap:16px;
+  margin:22px 0;
+}
+
+article{
+  background:white;
+  border:1px solid #d7e5d6;
+  border-radius:18px;
+  padding:22px;
+}
+
+h2{
+  font-size:17px;
+  margin:0 0 16px;
+}
+
+strong{
+  display:block;
+  font-size:34px;
+  color:#145b38;
+}
+
+small{
+  display:block;
+  margin-top:10px;
+  line-height:1.5;
+}
+
+.nota{
+  background:#e1ecdd;
+  border-radius:14px;
+  padding:18px;
+  line-height:1.6;
+}
+
+#estado{
+  line-height:1.6;
+}
+
+</style>
+
+
+<main>
+
+<header>
+
+<h1>Estación ambiental</h1>
+
+<div>
+Red local · Sin Internet
+</div>
+
+</header>
+
+
+<p
+  id="estado"
+  role="status"
+>
+Conectando con la estación…
+</p>
+
+
+<div class="grid">
+
+
+<article>
+
+<h2>
+Temperatura · DHT11
+</h2>
+
+<strong id="t">
+—
+</strong>
+
+<small id="dht">
+Esperando lectura
+</small>
+
+</article>
+
+
+<article>
+
+<h2>
+Humedad · DHT11
+</h2>
+
+<strong id="h">
+—
+</strong>
+
+<small>
+Humedad relativa
+</small>
+
+</article>
+
+
+<article>
+
+<h2>
+MQ-9 · Entrada analógica
+</h2>
+
+<strong id="mq">
+—
+</strong>
+
+<small>
+ADC de 0 a 1023 · Sin calibrar
+</small>
+
+</article>
+
+
+<article>
+
+<h2>
+DSM501A · Pulsos bajos
+</h2>
+
+<strong id="dsm">
+—
+</strong>
+
+<small>
+Ocupación temporal · Ventana de 30 s
+</small>
+
+</article>
+
+
+</div>
+
+
+<p class="nota">
+
+Lecturas experimentales no calibradas.
+
+El MQ-9 no mide CO₂ y su ADC no representa ppm de CO
+ni niveles seguros.
+
+La ocupación del DSM501A no es una concentración
+certificada de PM2.5 en µg/m³.
+
+Durante el arranque, esperar al menos un minuto
+de estabilización del DSM.
+
+</p>
+
+
+<script>
+
+const el = id =>
+  document.getElementById(id);
+
+
+async function actualizar(){
+
+  try{
+
+    const r = await fetch(
+      '/datos',
+      {
+        cache:'no-store',
+        signal:AbortSignal.timeout(3000)
+      }
+    );
+
+
+    if(!r.ok) throw Error();
+
+
+    const d = await r.json();
+
+
+    el('estado').textContent =
+      d.recibido
+      ?
+      (
+        d.conectado
+        ?
+        'Arduino conectado'
+        :
+        'Sin datos recientes del Arduino'
+      )
+      +
+      ' · Última trama válida hace '
+      +
+      (d.edad_ms/1000).toFixed(1)
+      +
+      ' s'
+      :
+      'Web conectada · Esperando primera trama del Arduino';
+
+
+    el('t').textContent =
+      d.temperatura === null
+      ?
+      '—'
+      :
+      d.temperatura.toFixed(1) + ' °C';
+
+
+    el('h').textContent =
+      d.humedad === null
+      ?
+      '—'
+      :
+      d.humedad.toFixed(1) + ' %';
+
+
+    el('dht').textContent =
+      !d.recibido
+      ?
+      'Esperando lectura'
+      :
+      d.estadoDHT
+      ?
+      'Lectura válida'
+      :
+      'Error DHT11';
+
+
+    el('mq').textContent =
+      d.mqADC === null
+      ?
+      '—'
+      :
+      d.mqADC;
+
+
+    el('dsm').textContent =
+      d.ocupacionDSM === null
+      ?
+      'Pendiente'
+      :
+      d.ocupacionDSM.toFixed(3) + ' %';
+
+  }
+
+  catch(e){
+
+    el('estado').textContent =
+      'Sin conexión HTTP con la estación · '
+      +
+      'Las cifras visibles son las últimas consultadas';
+
+  }
+
+  finally{
+
+    setTimeout(actualizar,1000);
+  }
+}
+
+
+actualizar();
+
+</script>
+
+</main>
+
+</html>
+
+)HTML";
+
+
+// ======================================================
+// VALIDAR NÚMERO RECIBIDO
+// ======================================================
+
+bool numero(const char *s, float &v) {
+
+  if (
+    !s[0] ||
+    s[0] == ' ' ||
+    s[0] == '\t'
+  ) {
+    return false;
+  }
+
+
+  char *fin;
+
+
+  v = strtof(
+    s,
+    &fin
+  );
+
+
+  return
+    fin != s &&
+    *fin == '\0' &&
+    isfinite(v);
+}
+
+
+// ======================================================
+// VALIDAR TRAMA CSV DEL ARDUINO
+// ======================================================
+
+bool aceptar(char *linea) {
+
+  char *campos[5];
+
+  campos[0] = linea;
+
+  int n = 1;
+
+
+  // Separar campos por comas
+
+  for (
+    char *p = linea;
+    *p;
+    ++p
+  ) {
+
+    if (*p == ',') {
+
+      if (n == 5) {
+        return false;
+      }
+
+      *p = '\0';
+
+      campos[n++] = p + 1;
+    }
+  }
+
+
+  if (n != 5) {
+    return false;
+  }
+
+
+  // ------------------------------
+  // Estado DHT
+  // ------------------------------
+
+  bool ok;
+
+
+  if (!strcmp(campos[4], "1")) {
+
+    ok = true;
+
+  }
+
+  else if (!strcmp(campos[4], "0")) {
+
+    ok = false;
+
+  }
+
+  else {
+
+    return false;
+  }
+
+
+  float t = 0;
+  float h = 0;
+  float m;
+  float o;
+
+
+  // ------------------------------
+  // Validar DHT11
+  // ------------------------------
+
+  if (ok) {
+
+    if (
+      !numero(campos[0], t) ||
+      !numero(campos[1], h) ||
+      t < -40 ||
+      t > 80 ||
+      h < 0 ||
+      h > 100
+    ) {
+
+      return false;
+    }
+  }
+
+  else if (
+    strcmp(campos[0], "nan") ||
+    strcmp(campos[1], "nan")
+  ) {
+
+    return false;
+  }
+
+
+  // ------------------------------
+  // Validar MQ-9
+  // ------------------------------
+
+  if (
+    !numero(campos[2], m) ||
+    m < 0 ||
+    m > 1023 ||
+    floorf(m) != m
+  ) {
+
+    return false;
+  }
+
+
+  // ------------------------------
+  // Validar DSM501A
+  // ------------------------------
+
+  if (
+    !numero(campos[3], o) ||
+    (
+      o != -1 &&
+      (
+        o < 0 ||
+        o > 100
+      )
+    )
+  ) {
+
+    return false;
+  }
+
+
+  // ==================================================
+  // ACTUALIZAR DATOS
+  // ==================================================
+
+  // Solo se actualizan después de validar
+  // correctamente los cinco campos.
+
+  temperatura = t;
+
+  humedad = h;
+
+  mq = (int)m;
+
+  dsm = o;
+
+  dhtOk = ok;
+
+  recibido = true;
+
+  ultimaTrama = millis();
+
+
+  Serial.printf(
+    "RX valida: MQ=%d DSM=%.3f DHT=%s\n",
+    mq,
+    dsm,
+    ok ? "OK" : "ERROR"
+  );
+
+
+  return true;
+}
+
+
+// ======================================================
+// LEER COMUNICACIÓN UART DESDE ARDUINO
+// ======================================================
+
+void leerUART() {
+
+  // Si una trama queda incompleta demasiado tiempo,
+  // se descarta para resincronizar.
+
+  if (
+    usados &&
+    (uint32_t)(millis() - ultimoByte) > 500
+  ) {
+
+    usados = 0;
+
+    descartar = true;
+  }
+
+
+  // Máximo 128 bytes por vuelta.
+  //
+  // Así el ESP32 puede seguir atendiendo
+  // simultáneamente el servidor HTTP.
+
+  for (
+    int i = 0;
+    i < 128 && Serial1.available();
+    ++i
+  ) {
+
+    char c = (char)Serial1.read();
+
+    ultimoByte = millis();
+
+
+    if (c == '\n') {
+
+      if (!descartar) {
+
+        if (
+          usados &&
+          bufferRx[usados - 1] == '\r'
+        ) {
+
+          --usados;
+        }
+
+
+        bufferRx[usados] = '\0';
+
+
+        if (!aceptar(bufferRx)) {
+
+          ++rechazadas;
+
+          Serial.println(
+            "CSV rechazado"
+          );
+        }
+
+      }
+
+      else {
+
+        ++rechazadas;
+
+        Serial.println(
+          "Trama descartada: longitud, ruido o timeout"
+        );
+      }
+
+
+      usados = 0;
+
+      descartar = false;
+    }
+
+    else if (!descartar) {
+
+      if (
+        (c < 32 && c != '\r') ||
+        c > 126 ||
+        usados >= sizeof(bufferRx) - 1
+      ) {
+
+        descartar = true;
+
+        usados = 0;
+
+      }
+
+      else {
+
+        bufferRx[usados++] = c;
+      }
+    }
+  }
+}
+
+
+// ======================================================
+// RESPUESTA /datos
+// ======================================================
+
+void datos() {
+
+  char t[24] = "null";
+  char h[24] = "null";
+  char m[16] = "null";
+  char o[24] = "null";
+  char edad[24] = "null";
+
+
+  uint32_t transcurrido =
+    (uint32_t)(
+      millis() - ultimaTrama
+    );
+
+
+  if (recibido) {
+
+    snprintf(
+      m,
+      sizeof(m),
+      "%d",
+      mq
+    );
+
+
+    snprintf(
+      edad,
+      sizeof(edad),
+      "%lu",
+      (unsigned long)transcurrido
+    );
+
+
+    if (dsm >= 0) {
+
+      snprintf(
+        o,
+        sizeof(o),
+        "%.3f",
+        dsm
+      );
+    }
+
+
+    if (dhtOk) {
+
+      snprintf(
+        t,
+        sizeof(t),
+        "%.1f",
+        temperatura
+      );
+
+
+      snprintf(
+        h,
+        sizeof(h),
+        "%.1f",
+        humedad
+      );
+    }
+  }
+
+
+  char json[400];
+
+
+  snprintf(
+    json,
+    sizeof(json),
+
+    "{\"recibido\":%s,"
+    "\"conectado\":%s,"
+    "\"edad_ms\":%s,"
+    "\"temperatura\":%s,"
+    "\"humedad\":%s,"
+    "\"mqADC\":%s,"
+    "\"ocupacionDSM\":%s,"
+    "\"estadoDHT\":%d,"
+    "\"rechazadas\":%lu}",
+
+    recibido
+      ? "true"
+      : "false",
+
+    recibido &&
+    transcurrido < 10000
+      ? "true"
+      : "false",
+
+    edad,
+
+    t,
+
+    h,
+
+    m,
+
+    o,
+
+    dhtOk
+      ? 1
+      : 0,
+
+    (unsigned long)rechazadas
+  );
+
+
+  servidor.sendHeader(
+    "Cache-Control",
+    "no-store"
+  );
+
+
+  servidor.send(
+    200,
+    "application/json; charset=utf-8",
+    json
+  );
+}
+
+
+// ======================================================
+// SETUP ESP32
+// ======================================================
+
+void setup() {
+
+  // Monitor Serie USB
+  Serial.begin(115200);
+
+
+  // ------------------------------
+  // Comunicación Arduino -> ESP32
+  // ------------------------------
+
+  Serial1.setRxBufferSize(256);
+
+  Serial1.begin(
+    9600,
+    SERIAL_8N1,
+    17,   // RX
+    18    // TX
+  );
+
+
+  // ------------------------------
+  // Crear red Wi-Fi local
+  // ------------------------------
+
+  WiFi.mode(WIFI_AP);
+
+
+  IPAddress ip(
+    192,
+    168,
+    4,
+    1
+  );
+
+
+  IPAddress mascara(
+    255,
+    255,
+    255,
+    0
+  );
+
+
+  bool configurada =
+    WiFi.softAPConfig(
+      ip,
+      ip,
+      mascara
+    );
+
+
+  bool creada =
+    WiFi.softAP(
+      "EstacionAmbiental",
+      "TallerDiseno2026"
+    );
+
+
+  Serial.printf(
+    "AP configurada=%d creada=%d\n",
+    configurada,
+    creada
+  );
+
+
+  Serial.print(
+    "Abrir http://"
+  );
+
+
+  Serial.println(
+    WiFi.softAPIP()
+  );
+
+
+  // ------------------------------
+  // Ruta principal
+  // ------------------------------
+
+  servidor.on(
+    "/",
+    HTTP_GET,
+    [](){
+
+      servidor.send_P(
+        200,
+        "text/html; charset=utf-8",
+        PAGINA
+      );
+    }
+  );
+
+
+  // ------------------------------
+  // Ruta de datos JSON
+  // ------------------------------
+
+  servidor.on(
+    "/datos",
+    HTTP_GET,
+    datos
+  );
+
+
+  // ------------------------------
+  // Ruta inexistente
+  // ------------------------------
+
+  servidor.onNotFound(
+    [](){
+
+      servidor.send(
+        404,
+        "text/plain",
+        "Ruta no encontrada"
+      );
+    }
+  );
+
+
+  servidor.begin();
+}
+
+
+// ======================================================
+// LOOP ESP32
+// ======================================================
+
+void loop() {
+
+  // Recibir datos provenientes del Arduino
+  leerUART();
+
+  // Atender solicitudes de celulares,
+  // computadores o tablets conectados por Wi-Fi
+  servidor.handleClient();
+}
