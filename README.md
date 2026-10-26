@@ -117,7 +117,7 @@ Pin 3 VCC   -> 5V
 Pin 4 Vout1 -> D7
 Pin 5 GND   -> GND
 
-Los pines 1 y 2 no se utilizan actualmente.
+Los pines 1 y 2 no se utilizan.
 
 El sistema mide cuánto tiempo permanece la señal del DSM501A en nivel LOW dentro de una ventana de:
 
@@ -126,8 +126,6 @@ El sistema mide cuánto tiempo permanece la señal del DSM501A en nivel LOW dent
 A partir de esto se calcula un porcentaje de ocupación temporal.
 
 Actualmente esta lectura se considera experimental y todavía está en proceso de validación.
-
-No corresponde directamente a una concentración certificada de PM2.5 en µg/m³.
 
 ⸻
 
