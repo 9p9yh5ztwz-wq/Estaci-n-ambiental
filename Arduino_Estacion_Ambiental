@@ -1,0 +1,315 @@
+#include <SoftwareSerial.h>
+#include <DHT.h>
+#include <util/atomic.h>
+#include <avr/interrupt.h>
+#include <math.h>
+
+// ==========================================
+// CONFIGURACIÓN DE PINES
+// ==========================================
+
+// Comunicación con ESP32
+// Arduino D10 = RX
+// Arduino D11 = TX
+SoftwareSerial enlace(10, 11);
+
+// DHT11: temperatura y humedad
+// S -> D4
+// + -> 5V
+// - -> GND
+DHT dht(4, DHT11);
+
+// MQ-9: salida analógica
+// AO -> A0
+// VCC -> 5V
+// GND -> GND
+const int MQ_PIN = A0;
+
+// DSM501A: partículas
+// Vout1 -> D7
+// VCC -> 5V
+// GND -> GND
+const int DSM_PIN = 7;
+
+// LED actuador
+// D8 -> resistencia 220 ohm -> LED -> GND
+const int LED_PIN = 8;
+
+// UMBRAL EXPERIMENTAL
+// Humedad >= 50%: LED encendido
+// Humedad < 50%: LED apagado
+const float UMBRAL_HUMEDAD = 60.0;
+
+// ==========================================
+// VARIABLES DEL DSM501A
+// ==========================================
+
+// Ventana de medición de 30 segundos
+const uint32_t VENTANA_US = 30000000UL;
+
+volatile uint32_t acumulado = 0;
+volatile uint32_t cambioUs = 0;
+volatile bool bajo = false;
+
+uint32_t inicioVentana;
+uint32_t ultimaLectura;
+
+float ocupacion = -1;
+
+// ==========================================
+// VARIABLES DE COMUNICACIÓN
+// ==========================================
+
+char trama[80];
+uint8_t longitud = 0;
+uint8_t enviado = 0;
+
+// ==========================================
+// INTERRUPCIÓN TIMER1
+// ==========================================
+
+// Muestra la señal del DSM501A cada 100 us.
+// Reservamos Timer1 para esta función.
+
+ISR(TIMER1_COMPA_vect) {
+
+  bool nuevo = (PIND & _BV(PD7)) == 0;
+  uint32_t ahora = micros();
+
+  if (nuevo != bajo) {
+
+    if (bajo) {
+      acumulado += (uint32_t)(ahora - cambioUs);
+    }
+
+    cambioUs = ahora;
+    bajo = nuevo;
+  }
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // Comunicación Arduino -> ESP32
+  enlace.begin(9600);
+  enlace.stopListening();
+
+  // Iniciar DHT11
+  dht.begin();
+
+  // DSM501A
+  pinMode(DSM_PIN, INPUT);
+
+  // LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // Configurar Timer1
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+
+    inicioVentana = cambioUs = micros();
+    bajo = (PIND & _BV(PD7)) == 0;
+
+    TCCR1A = 0;
+    TCCR1B = 0;
+    TCNT1 = 0;
+
+    OCR1A = 199;
+
+    TIFR1 = _BV(OCF1A);
+    TIMSK1 = _BV(OCIE1A);
+
+    TCCR1B = _BV(WGM12) | _BV(CS11);
+  }
+
+  ultimaLectura = millis();
+
+  Serial.println("================================");
+  Serial.println("ESTACION AMBIENTAL INICIADA");
+  Serial.println("Arduino UNO + ESP32");
+  Serial.println("================================");
+
+  Serial.println("Sensores:");
+  Serial.println("- DHT11: D4");
+  Serial.println("- MQ-9: A0");
+  Serial.println("- DSM501A: D7");
+  Serial.println("- LED: D8");
+
+  Serial.println("LED encendido con humedad >= 50%");
+  Serial.println();
+}
+
+// ==========================================
+// LOOP
+// ==========================================
+
+void loop() {
+
+  uint32_t ahora = micros();
+
+  // ========================================
+  // 1. MEDICIÓN DSM501A
+  // ========================================
+
+  if ((uint32_t)(ahora - inicioVentana) >= VENTANA_US) {
+
+    uint32_t tiempoBajo;
+    uint32_t fin;
+
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+
+      fin = micros();
+
+      tiempoBajo = acumulado;
+
+      if (bajo) {
+        tiempoBajo += (uint32_t)(fin - cambioUs);
+      }
+
+      acumulado = 0;
+      cambioUs = fin;
+    }
+
+    ocupacion =
+      100.0f * tiempoBajo /
+      (uint32_t)(fin - inicioVentana);
+
+    inicioVentana = fin;
+
+    Serial.print("DSM501A - Pulsos bajos: ");
+    Serial.print(ocupacion, 3);
+    Serial.println(" %");
+  }
+
+  // ========================================
+  // 2. LECTURA CADA 2,5 SEGUNDOS
+  // ========================================
+
+  if (
+    enviado == longitud &&
+    (uint32_t)(millis() - ultimaLectura) >= 2500UL
+  ) {
+
+    ultimaLectura = millis();
+
+    // Leer DHT11
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    bool ok = isfinite(t) && isfinite(h);
+
+    // ======================================
+    // 3. CONTROL AUTOMÁTICO DEL LED
+    // ======================================
+
+    if (ok && h >= UMBRAL_HUMEDAD) {
+
+      digitalWrite(LED_PIN, HIGH);
+
+    } else {
+
+      digitalWrite(LED_PIN, LOW);
+    }
+
+    // ======================================
+    // 4. LEER MQ-9
+    // ======================================
+
+    int mq = analogRead(MQ_PIN);
+
+    // ======================================
+    // 5. MOSTRAR LECTURAS
+    // ======================================
+
+    Serial.println("---------------------------");
+
+    if (ok) {
+
+      Serial.print("Temperatura: ");
+      Serial.print(t, 1);
+      Serial.println(" C");
+
+      Serial.print("Humedad: ");
+      Serial.print(h, 1);
+      Serial.println(" %");
+
+    } else {
+
+      Serial.println("ERROR: DHT11 no responde");
+    }
+
+    Serial.print("MQ-9 ADC: ");
+    Serial.println(mq);
+
+    Serial.print("DSM501A: ");
+
+    if (ocupacion < 0) {
+      Serial.println("Esperando primera ventana...");
+    } else {
+      Serial.print(ocupacion, 3);
+      Serial.println(" %");
+    }
+
+    Serial.print("LED D8: ");
+
+    if (digitalRead(LED_PIN) == HIGH) {
+      Serial.println("ENCENDIDO");
+    } else {
+      Serial.println("APAGADO");
+    }
+
+    // ======================================
+    // 6. PREPARAR DATOS PARA EL ESP32
+    // ======================================
+
+    char ts[16];
+    char hs[16];
+    char ds[16];
+
+    if (ok) {
+
+      dtostrf(t, 1, 1, ts);
+      dtostrf(h, 1, 1, hs);
+
+    } else {
+
+      strcpy(ts, "nan");
+      strcpy(hs, "nan");
+    }
+
+    dtostrf(ocupacion, 1, 3, ds);
+
+    // Formato CSV:
+    // temperatura,humedad,MQ,DSM,estadoDHT
+
+    longitud = (uint8_t)snprintf(
+      trama,
+      sizeof(trama),
+      "%s,%s,%d,%s,%u\n",
+      ts,
+      hs,
+      mq,
+      ds,
+      ok ? 1 : 0
+    );
+
+    enviado = 0;
+
+    Serial.print("Enviando al ESP32: ");
+    Serial.print(trama);
+  }
+
+  // ========================================
+  // 7. ENVIAR DATOS AL ESP32
+  // ========================================
+
+  if (enviado < longitud) {
+
+    enlace.write((uint8_t)trama[enviado++]);
+  }
+}
