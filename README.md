@@ -1,4 +1,4 @@
-# Estacion-ambiental
+# Estación ambiental
 Prototipo IoT para monitoreo ambiental – Taller de Diseño en Ingeniería
 Estación Ambiental IoT
 
